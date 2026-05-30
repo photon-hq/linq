@@ -1,7 +1,7 @@
 {
   "name": "@photon-ai/linq",
   "version": "0.1.0",
-  "description": "LinQ adapter for Spectrum — Fusor inbound + LinQ HTTP outbound.",
+  "description": "Linq adapter for Spectrum.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/photon-hq/linq.git"
@@ -33,8 +33,8 @@
     }
   },
   "scripts": {
-    "build": "tsup",
-    "dev": "tsup --watch",
+    "build": "tsdown",
+    "dev": "tsdown --watch",
     "check": "tsc --noEmit",
     "test": "bun test"
   },
@@ -51,7 +51,7 @@
     "@photon-ai/proto": "^0.2.4",
     "@types/bun": "latest",
     "spectrum-ts": "file:../spectrum-ts/packages/spectrum-ts",
-    "tsup": "^8.4.0",
+    "tsdown": "^0.22.1",
     "typescript": "^5",
     "ultracite": "7.8.0",
     "zod": "^4"
