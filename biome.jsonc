@@ -1,0 +1,15 @@
+{
+  "$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+  "extends": ["ultracite/biome/core", "ultracite/biome/vitest"],
+  "linter": {
+    "rules": {
+      "suspicious": {
+        "useAwait": "off",
+        "noEmptyBlockStatements": "off"
+      }
+    }
+  },
+  "files": {
+    "includes": ["!!bun.lock"]
+  }
+}
