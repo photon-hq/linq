@@ -31,6 +31,9 @@ import { linq } from "@photon-ai/linq";
 const app = await Spectrum({
   projectId: process.env.PROJECT_ID,
   projectSecret: process.env.PROJECT_SECRET,
+  // Verifies the outer Fusor origin signature on inbound webhook POSTs.
+  // Optional but recommended; when omitted the origin check is skipped.
+  webhookSecret: process.env.SPECTRUM_WEBHOOK_SECRET,
   providers: [
     linq.config({
       apiKey: process.env.LINQ_API_KEY,
@@ -58,6 +61,23 @@ server.post("/webhooks/fusor", (c) =>
   })
 );
 ```
+
+### Webhook signing
+
+Inbound POSTs are verified in two independent layers:
+
+| Layer | Secret | Set on | Header(s) | Signed payload |
+| --- | --- | --- | --- | --- |
+| **Outer** — request came from Fusor | `webhookSecret` | `Spectrum({...})` | `x-spectrum-signature` / `x-spectrum-timestamp` | `v0:{timestamp}:` + raw body bytes, signature prefixed `v0=` |
+| **Inner** — event came from LinQ | `webhookSigningSecret` | `linq.config({...})` | `x-webhook-signature` / `x-webhook-timestamp` | `{timestamp}.{body}` |
+
+Both use `HMAC-SHA256` and are **opt-in**: when a secret is omitted, that layer's
+check is skipped. Set both in production — the outer secret proves the request
+reached you through Fusor, the inner one proves the payload originated at LinQ.
+
+Only the inner LinQ layer is replay-guarded (`replayToleranceSec`); the outer
+Fusor layer intentionally does not enforce timestamp freshness, since Fusor
+retries can legitimately reuse an older sign-time.
 
 ## Config
 

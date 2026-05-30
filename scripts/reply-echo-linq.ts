@@ -96,9 +96,11 @@ const startNgrok = async (port: number): Promise<NgrokTunnel | undefined> => {
 };
 
 const app = await Spectrum({
-  projectId: process.env.PROJECT_ID,
-  projectSecret: process.env.PROJECT_SECRET,
-  webhookSecret: process.env.WEBHOOK_SECRET,
+  projectId: process.env.PROJECT_ID!,
+  projectSecret: process.env.PROJECT_SECRET!,
+  // Disabled as of v0.1.1 since Fusor already verifies the delivery signature.
+  // In most cases you only need one layer of signature verification (either Fusor or LinQ's own HMAC); enabling both is redundant.
+  // webhookSecret: process.env.WEBHOOK_SECRET!,
   providers: [
     linq.config({
       apiKey: process.env.LINQ_API_KEY ?? "",

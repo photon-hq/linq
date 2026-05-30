@@ -1,6 +1,6 @@
 {
   "name": "@photon-ai/linq",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Linq adapter for Spectrum.",
   "repository": {
     "type": "git",
@@ -50,7 +50,7 @@
     "@biomejs/biome": "^2.4.12",
     "@photon-ai/proto": "^0.2.4",
     "@types/bun": "latest",
-    "spectrum-ts": "file:../spectrum-ts/packages/spectrum-ts",
+    "spectrum-ts": "^1.16.0",
     "tsdown": "^0.22.1",
     "typescript": "^5",
     "ultracite": "7.8.0",
