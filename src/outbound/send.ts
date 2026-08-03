@@ -1,4 +1,11 @@
-import type { Avatar, Content, Edit, Reaction, Voice } from "spectrum-ts";
+import type {
+  Avatar,
+  Content,
+  Edit,
+  Reaction,
+  Unsend,
+  Voice,
+} from "spectrum-ts";
 import { UnsupportedError } from "spectrum-ts";
 import type { ProviderMessageRecord } from "spectrum-ts/authoring";
 import { getClient, type LinqClient, type StoreLike } from "../client";
@@ -32,11 +39,41 @@ const requireExistingChat = (space: LinqSpace, action: string): string => {
 
 const sendReaction = async (
   client: LinqClient,
+  space: LinqSpace,
   content: Reaction
-): Promise<undefined> => {
+): Promise<ProviderMessageRecord> => {
   const { type, customEmoji } = emojiToReaction(content.emoji);
   await client.addReaction(content.target.id, {
     operation: "add",
+    type,
+    ...(customEmoji ? { customEmoji } : {}),
+  });
+  // LinQ acknowledges a tapback without returning a reaction id. Spectrum
+  // v12 models reactions as messages, so synthesize the stable handle that
+  // `message.react()` requires (and that `unsend()` can later remove).
+  return {
+    id: `reaction:${encodeURIComponent(content.target.id)}:self:${encodeURIComponent(content.emoji)}`,
+    content,
+    space: { id: space.id },
+    timestamp: new Date(),
+  };
+};
+
+const sendUnsend = async (
+  client: LinqClient,
+  content: Unsend
+): Promise<undefined> => {
+  const targetContent = content.target.content;
+  if (targetContent.type !== "reaction") {
+    throw UnsupportedError.action(
+      "unsend",
+      LINQ_PLATFORM,
+      "only reactions can currently be unsent."
+    );
+  }
+  const { type, customEmoji } = emojiToReaction(targetContent.emoji);
+  await client.addReaction(targetContent.target.id, {
+    operation: "remove",
     type,
     ...(customEmoji ? { customEmoji } : {}),
   });
@@ -173,9 +210,9 @@ const sendOutboundMessage = async (
 };
 
 /**
- * Outbound dispatcher. Fire-and-forget signals (reaction, typing, rename,
- * avatar, edit) return `undefined`; message-producing content returns a record
- * with the LinQ message id. `poll` is unsupported (LinQ has no polls).
+ * Outbound dispatcher. Fire-and-forget signals (typing, rename, avatar, edit,
+ * unsend) return `undefined`; reactions and message-producing content return a
+ * record. `poll` is unsupported (LinQ has no polls).
  */
 export const send = async ({
   space,
@@ -186,7 +223,9 @@ export const send = async ({
   const client = getClient(store, config);
   switch (content.type) {
     case "reaction":
-      return await sendReaction(client, content);
+      return await sendReaction(client, space, content);
+    case "unsend":
+      return await sendUnsend(client, content);
     case "typing":
       return await sendTyping(client, space, content.state);
     case "rename":
