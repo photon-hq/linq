@@ -6,6 +6,7 @@ import {
   reaction,
   reply,
   text,
+  unsend,
   voice,
 } from "spectrum-ts";
 import type { LinqClient } from "../src/client";
@@ -162,18 +163,50 @@ describe("send — voice & reactions", () => {
     expect(memo?.args[1]).toEqual({ attachmentId: "att-1" });
   });
 
-  it("maps a heart emoji to the love tapback and returns undefined", async () => {
+  it("maps a heart emoji and returns Spectrum v12's reaction record", async () => {
     const { calls, store } = setup();
+    const content = await reaction("❤️", stubTarget).build();
     const result = await send({
       space: chatSpace,
-      content: await reaction("❤️", stubTarget).build(),
+      content,
       config,
       store,
     });
-    expect(result).toBeUndefined();
+    expect(result).toMatchObject({
+      id: "reaction:tgt-1:self:%E2%9D%A4%EF%B8%8F",
+      content,
+      space: { id: "chat-1" },
+    });
+    expect(result?.timestamp).toBeInstanceOf(Date);
     const react = find(calls, "addReaction");
     expect(react?.args[0]).toBe("tgt-1");
     expect(react?.args[1]).toEqual({ operation: "add", type: "love" });
+  });
+
+  it("removes a reaction when its Spectrum message is unsent", async () => {
+    const { calls, store } = setup();
+    const reactionContent = await reaction("🎉", stubTarget).build();
+    const reactionTarget = {
+      id: "reaction-1",
+      content: reactionContent,
+      direction: "outbound",
+    } as unknown as Message;
+
+    const result = await send({
+      space: chatSpace,
+      content: await unsend(reactionTarget).build(),
+      config,
+      store,
+    });
+
+    expect(result).toBeUndefined();
+    const react = find(calls, "addReaction");
+    expect(react?.args[0]).toBe("tgt-1");
+    expect(react?.args[1]).toEqual({
+      operation: "remove",
+      type: "custom",
+      customEmoji: "🎉",
+    });
   });
 });
 

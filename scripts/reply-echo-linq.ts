@@ -1,13 +1,31 @@
-import { linq } from "@photon-ai/linq";
-import { type Content, type ContentBuilder, Spectrum } from "spectrum-ts";
+import {
+  FusorJsonWebhookError,
+  linq,
+  normalizeFusorWebhookRequest,
+} from "@photon-ai/linq";
+import {
+  type Content,
+  type ContentBuilder,
+  type Message,
+  type Space,
+  Spectrum,
+} from "spectrum-ts";
 
 /**
  * Minimal LinQ reply-echo bot over Fusor webhook delivery, with an auto-started
  * ngrok tunnel so you have a public URL to paste into your Fusor subscription.
  *
  * Unlike `echo-linq.ts` (which posts a standalone `echo: …` message), this echoes
- * each inbound message straight back as a *threaded reply* via `message.reply()`,
- * which LinQ delivers as a `reply_to` so the echo appears inline under the original.
+ * each inbound message straight back: text, links, images and files thread under
+ * the original via `message.reply()` (a LinQ `reply_to`), while voice notes echo
+ * as a fresh voice memo (LinQ voice memos carry no `reply_to`, so they can't
+ * thread). Multi-part messages are echoed one reply per part.
+ *
+ * Spectrum v12 replies as soon as the event is verified and then runs the echo
+ * handler detached — Fusor's ack window isn't blocked by uploads (or, in a real
+ * bot, slow AI work) that would otherwise time out and trigger an at-least-once
+ * redelivery. Spectrum logs a thrown echo; a small in-memory dedup on
+ * `message.id` guards against duplicates.
  *
  * Usage:
  *   LINQ_API_KEY=… \
@@ -17,11 +35,11 @@ import { type Content, type ContentBuilder, Spectrum } from "spectrum-ts";
  *   bun run scripts/reply-echo-linq.ts
  *
  * Two independent signature layers are exercised here (both opt-in):
- *   - WEBHOOK_SECRET       → Spectrum verifies fusor signed the POST (X-Spectrum-*)
+ *   - WEBHOOK_SECRET       → the JSON relay normalizer verifies X-Spectrum-*
  *   - LINQ_WEBHOOK_SECRET  → the LinQ adapter verifies LinQ's webhook HMAC
  *
- * Replying is loop-safe: our reply emits a `message.sent` webhook, which the LinQ
- * adapter ignores — so the bot never replies to its own replies.
+ * Echoing is loop-safe: our echo emits a `message.sent` webhook, which the LinQ
+ * adapter ignores — so the bot never echoes its own echoes.
  *
  * If `ngrok` is on your PATH (or already running), the public webhook URL is
  * printed on boot; otherwise start it yourself with `ngrok http <port>`.
@@ -33,15 +51,90 @@ const NGROK_API = "http://127.0.0.1:4040/api/tunnels";
 const NGROK_BOOT_TIMEOUT_MS = 15_000;
 const NGROK_POLL_INTERVAL_MS = 400;
 
-type NgrokTunnel = { stop: () => void; url: string };
+interface NgrokTunnel {
+  stop: () => void;
+  url: string;
+}
 
 /**
  * Wrap an already-resolved inbound `Content` back into a builder so it can be
- * echoed straight back through `message.reply()`.
+ * echoed straight back through `reply()` or `send()`.
  */
 const passthrough = (content: Content): ContentBuilder => ({
   build: async () => content,
 });
+
+// Inbound message ids we've already echoed. Spectrum v12 acknowledges before
+// invoking the handler, but at-least-once delivery can still redeliver — this
+// keeps the echo at-most-once. Bounded so it can't grow without limit.
+const processed = new Set<string>();
+const PROCESSED_CAP = 1000;
+const alreadyEchoed = (id: string): boolean => {
+  if (processed.has(id)) {
+    return true;
+  }
+  processed.add(id);
+  if (processed.size > PROCESSED_CAP) {
+    const oldest = processed.values().next().value; // Set keeps insertion order
+    if (oldest !== undefined) {
+      processed.delete(oldest);
+    }
+  }
+  return false;
+};
+
+/**
+ * Echo one inbound message back to its space. Spectrum v12's webhook contract
+ * replies first and runs this detached, so slow work (file uploads now, AI
+ * workflows later) never delays Fusor's response. A throw is logged rather
+ * than changing the already-computed HTTP response.
+ *
+ * Text, links, images and files thread back via `message.reply()`. Voice can't
+ * thread (LinQ voice memos have no `reply_to`), so it's echoed as a fresh voice
+ * memo via `space.send()`. Multi-part `group` messages are echoed per part.
+ * System signals (reactions, typing, opaque custom) are skipped.
+ */
+const echoInbound = async (space: Space, message: Message): Promise<void> => {
+  const { content } = message;
+  if (
+    content.type === "reaction" ||
+    content.type === "typing" ||
+    content.type === "custom"
+  ) {
+    return;
+  }
+  if (alreadyEchoed(message.id)) {
+    return;
+  }
+
+  // Voice can't thread, so it goes out as a new voice memo; everything else
+  // threads back via reply.
+  const echo = (part: Content) =>
+    part.type === "voice"
+      ? space.send(passthrough(part))
+      : message.reply(passthrough(part));
+
+  const parts =
+    content.type === "group"
+      ? content.items.map((item) => item.content)
+      : [content];
+  // A throw here propagates to Spectrum, which logs it (we've already acked, so
+  // there's no retry) — no local try/catch needed.
+  for (const part of parts) {
+    const sent = await echo(part);
+    console.log(
+      `[reply-echo] echoed ${message.id} in ${message.space.id} (id=${sent?.id})`
+    );
+  }
+
+  // Tapback the original message (👍 → LinQ "like"). Best-effort.
+  try {
+    await message.react("👍");
+    console.log(`[reply-echo] reacted 👍 to ${message.id}`);
+  } catch (err) {
+    console.error(`[reply-echo] react failed for ${message.id}:`, err);
+  }
+};
 
 /** Read the public https URL from a running ngrok agent's local API. */
 const fetchNgrokUrl = async (): Promise<string | undefined> => {
@@ -72,19 +165,22 @@ const startNgrok = async (port: number): Promise<NgrokTunnel | undefined> => {
     return { url: existing, stop: () => undefined };
   }
 
-  const bin = Bun.which("ngrok");
+  const bin = globalThis.Bun.which("ngrok");
   if (!bin) {
     return;
   }
 
-  const proc = Bun.spawn([bin, "http", String(port), "--log", "stdout"], {
-    stdout: "ignore",
-    stderr: "ignore",
-  });
+  const proc = globalThis.Bun.spawn(
+    [bin, "http", String(port), "--log", "stdout"],
+    {
+      stdout: "ignore",
+      stderr: "ignore",
+    }
+  );
 
   const deadline = Date.now() + NGROK_BOOT_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    await Bun.sleep(NGROK_POLL_INTERVAL_MS);
+    await globalThis.Bun.sleep(NGROK_POLL_INTERVAL_MS);
     const url = await fetchNgrokUrl();
     if (url) {
       return { url, stop: () => proc.kill() };
@@ -95,59 +191,40 @@ const startNgrok = async (port: number): Promise<NgrokTunnel | undefined> => {
   return;
 };
 
-const app = await Spectrum({
-  projectId: process.env.PROJECT_ID!,
-  projectSecret: process.env.PROJECT_SECRET!,
-  // Disabled as of v0.1.1 since Fusor already verifies the delivery signature.
-  // In most cases you only need one layer of signature verification (either Fusor or LinQ's own HMAC); enabling both is redundant.
-  // webhookSecret: process.env.WEBHOOK_SECRET!,
-  providers: [
-    linq.config({
-      apiKey: process.env.LINQ_API_KEY ?? "",
-      webhookSigningSecret: process.env.LINQ_WEBHOOK_SECRET,
-      defaultFrom: process.env.LINQ_DEFAULT_FROM,
-    }),
-  ],
+const provider = linq.config({
+  apiKey: process.env.LINQ_API_KEY ?? "",
+  webhookSigningSecret: process.env.LINQ_WEBHOOK_SECRET,
+  defaultFrom: process.env.LINQ_DEFAULT_FROM,
 });
+const projectId = process.env.PROJECT_ID;
+const projectSecret = process.env.PROJECT_SECRET;
+if (Boolean(projectId) !== Boolean(projectSecret)) {
+  throw new Error("Set both PROJECT_ID and PROJECT_SECRET, or neither.");
+}
+const app =
+  projectId && projectSecret
+    ? await Spectrum({ projectId, projectSecret, providers: [provider] })
+    : await Spectrum({ providers: [provider] });
 
-const server = Bun.serve({
+const server = globalThis.Bun.serve({
   port: PORT,
   routes: {
     [WEBHOOK_PATH]: {
-      POST: (req) =>
-        app.webhook(req, async (_space, message) => {
-          // Only echo content reply() can thread. Skip system signals (typing,
-          // reactions) and multi-part groups, which reply() refuses to wrap.
-          if (
-            message.content.type === "reaction" ||
-            message.content.type === "typing" ||
-            message.content.type === "custom" ||
-            message.content.type === "group"
-          ) {
-            return;
+      // Spectrum v12 invokes echoInbound after computing the response, so a
+      // slow echo never blocks Fusor's acknowledgement window.
+      POST: async (req) => {
+        try {
+          const normalized = await normalizeFusorWebhookRequest(req, {
+            webhookSecret: process.env.WEBHOOK_SECRET,
+          });
+          return await app.webhook(normalized, echoInbound);
+        } catch (error) {
+          if (error instanceof FusorJsonWebhookError) {
+            return new Response(error.message, { status: error.status });
           }
-          try {
-            const echoed = await message.reply(passthrough(message.content));
-            console.log(
-              `[reply-echo] replied to ${message.id} in ${message.space.id} (id=${echoed?.id})`
-            );
-          } catch (err) {
-            // Spectrum only logs a generic "handler threw" to OTel and returns
-            // 500 — surface the real error (with stack) here so it's visible.
-            console.error(`[reply-echo] reply failed for ${message.id}:`, err);
-            throw err; // re-throw to keep the 500 (Fusor records/retries the failure)
-          }
-
-          // Also tapback the original message (👍 → LinQ "like"). Best-effort:
-          // a failed reaction shouldn't 500 the delivery and trigger a duplicate
-          // echo on the Fusor retry.
-          try {
-            await message.react("👍");
-            console.log(`[reply-echo] reacted 👍 to ${message.id}`);
-          } catch (err) {
-            console.error(`[reply-echo] react failed for ${message.id}:`, err);
-          }
-        }),
+          throw error;
+        }
+      },
     },
   },
 });
